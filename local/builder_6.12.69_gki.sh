@@ -15,8 +15,10 @@ read -p "是否启用susfs？(y/n，默认：y): " APPLY_SUSFS
 APPLY_SUSFS=${APPLY_SUSFS:-y}
 read -p "是否启用 KPM？(y-启用 KpatchNext独立kpm实现, n-关闭kpm，默认：n): " USE_PATCH_LINUX
 USE_PATCH_LINUX=${USE_PATCH_LINUX:-n}
-read -p "KSU分支版本(r=BakaSU, y=SukiSU Ultra, n=KernelSU Next, k=KSU, l=lkm模式(无内置KSU), 默认：r): " KSU_BRANCH
+read -p "KSU分支版本(r=BakaSU, y=SukiSU Ultra, f=FinaSU, n=KernelSU Next, k=KSU, l=lkm模式(无内置KSU), 默认：r): " KSU_BRANCH
 KSU_BRANCH=${KSU_BRANCH:-r}
+read -p "KSU源码分支/标签(可选, 回车使用默认: BakaSU/SukiSU=main, FinaSU=master, KernelSU Next=dev-susfs, KSU=main, 例如: sync-up): " KSU_SRC_BRANCH
+KSU_SRC_BRANCH=${KSU_SRC_BRANCH:-}
 read -p "是否应用 lz4 1.10.0 & zstd 1.5.7 补丁？(y/n，默认：y): " APPLY_LZ4
 APPLY_LZ4=${APPLY_LZ4:-y}
 read -p "是否应用 lz4kd 补丁？(y/n，默认：n): " APPLY_LZ4KD
@@ -38,6 +40,8 @@ if [[ "$KSU_BRANCH" == "y" || "$KSU_BRANCH" == "Y" ]]; then
   KSU_TYPE="SukiSU Ultra"
 elif [[ "$KSU_BRANCH" == "r" || "$KSU_BRANCH" == "R" ]]; then
   KSU_TYPE="BakaSU"
+elif [[ "$KSU_BRANCH" == "f" || "$KSU_BRANCH" == "F" ]]; then
+  KSU_TYPE="FinaSU"
 elif [[ "$KSU_BRANCH" == "n" || "$KSU_BRANCH" == "N" ]]; then
   KSU_TYPE="KernelSU Next"
 elif [[ "$KSU_BRANCH" == "k" || "$KSU_BRANCH" == "K" ]]; then
@@ -46,11 +50,40 @@ else
   KSU_TYPE="no KSU"
 fi
 
+# ===== 解析 KSU 源码仓库与默认分支 =====
+# 未指定分支时回落到各管理器默认分支，保证与旧行为一致
+case "$KSU_BRANCH" in
+  y|Y|r|R) KSU_REPO="Baka-SU/BakaSU";         KSU_DEFAULT_BRANCH="main" ;;
+  f|F)     KSU_REPO="LyraVoid/FinaSU";         KSU_DEFAULT_BRANCH="master" ;;
+  n|N)     KSU_REPO="pershoot/KernelSU-Next"; KSU_DEFAULT_BRANCH="dev-susfs" ;;
+  k|K)     KSU_REPO="tiann/KernelSU";         KSU_DEFAULT_BRANCH="main" ;;
+  *)       KSU_REPO="";                       KSU_DEFAULT_BRANCH="" ;;
+esac
+
+if [[ -n "$KSU_SRC_BRANCH" && -z "$KSU_REPO" ]]; then
+  echo ">>> 警告：当前为无内置KSU模式，分支参数 '$KSU_SRC_BRANCH' 将被忽略"
+  KSU_SRC_BRANCH=""
+fi
+KSU_SRC_BRANCH="${KSU_SRC_BRANCH:-$KSU_DEFAULT_BRANCH}"
+
+# ===== 分支名合法性校验（防注入 / 非法 git ref） =====
+if [[ -n "$KSU_SRC_BRANCH" ]]; then
+  if ! [[ "$KSU_SRC_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$ ]]; then
+    echo "错误：KSU 分支名不合法 -> '$KSU_SRC_BRANCH'"
+    echo "仅允许字母、数字、点、下划线、斜杠和连字符，且不能以连字符开头"
+    exit 1
+  fi
+  case "$KSU_SRC_BRANCH" in
+    *..*) echo "错误：KSU 分支名不合法（不允许包含 '..'）-> '$KSU_SRC_BRANCH'"; exit 1 ;;
+  esac
+fi
+
 echo
 echo "===== 配置信息 ====="
 echo "适用机型: $MANIFEST"
 echo "自定义内核后缀: -$CUSTOM_SUFFIX"
 echo "KSU分支版本: $KSU_TYPE"
+echo "KSU源码分支: ${KSU_SRC_BRANCH:-（不适用）}"
 echo "启用susfs: $APPLY_SUSFS"
 echo "启用 KPM: $USE_PATCH_LINUX"
 echo "应用 lz4&zstd 补丁: $APPLY_LZ4"
@@ -132,28 +165,85 @@ sed -i 's/${scm_version}//' ./common/scripts/setlocalversion
 echo "CONFIG_LOCALVERSION_AUTO=n" >> ./common/arch/arm64/configs/gki_defconfig
 
 # ===== 拉取 KSU 并设置版本号 =====
+# 校验指定的分支/标签在远端确实存在，不存在则立即退出，避免白等一次完整编译
+if [[ -n "$KSU_REPO" ]]; then
+  echo ">>> 校验 KSU 源码分支：$KSU_REPO @ $KSU_SRC_BRANCH"
+  if ! git ls-remote --exit-code "https://github.com/$KSU_REPO" "refs/heads/$KSU_SRC_BRANCH" "refs/tags/$KSU_SRC_BRANCH" > /dev/null 2>&1; then
+    echo "错误：$KSU_REPO 中不存在分支/标签 '$KSU_SRC_BRANCH'，请检查后重试"
+    echo "该仓库当前可用的分支："
+    git ls-remote --heads "https://github.com/$KSU_REPO" | sed 's#.*refs/heads/##' | sort || true
+    exit 1
+  fi
+fi
+
+# 校验上游 setup.sh 是否真的切到了指定分支（上游在 checkout 失败时只打印提示、不会退出）
+verify_ksu_ref() {
+  local dir="$1"
+  local want="$2"
+  local actual=""
+  if [[ ! -d "$dir" ]]; then
+    echo "错误：未找到 KSU 源码目录 $dir（上游 setup.sh 可能执行失败）"
+    return 1
+  fi
+  actual="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [[ "$actual" == "HEAD" || -z "$actual" ]]; then
+    actual="$(git -C "$dir" describe --tags --exact-match 2>/dev/null || true)"
+  fi
+  if [[ -z "$actual" ]]; then
+    actual="$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || true)"
+  fi
+  if [[ "$actual" != "$want" ]]; then
+    echo "错误：KSU 源码实际位于 '$actual'，与指定的 '$want' 不一致"
+    return 1
+  fi
+  echo ">>> KSU 源码已确认位于：$actual"
+}
+
 if [[ $KSU_BRANCH == [yYrR] ]]; then
   echo ">>> 拉取 BakaSU 并设置版本（由于SukiSU长期未维护无法正常编译，且BakaSU兼容sukisu管理器，故SukiSU源码仓库已重定向为bakasu）..."
-  curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s main
+  curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s "$KSU_SRC_BRANCH"
+  verify_ksu_ref ./KernelSU "$KSU_SRC_BRANCH" || exit 1
   echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
 elif [[ "$KSU_BRANCH" == "n" || "$KSU_BRANCH" == "N" ]]; then
   echo ">>> 拉取 KernelSU Next 并设置版本..."
-  curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
+  curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s "$KSU_SRC_BRANCH"
+  verify_ksu_ref ./KernelSU-Next "$KSU_SRC_BRANCH" || exit 1
   cd KernelSU-Next
+  # 版本号按当前分支本地提交计数生成，换分支后依然准确，也不再依赖 GitHub API 分页
+  KSU_VERSION=$(expr $(git rev-list --count HEAD) + 30000 2>/dev/null || echo 114514)
   rm -rf .git
-  KSU_VERSION=$(expr $(curl -sI "https://api.github.com/repos/pershoot/KernelSU-Next/commits?sha=dev&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p') "+" 30000)
   sed -i "s/KSU_VERSION_FALLBACK := 1/KSU_VERSION_FALLBACK := $KSU_VERSION/g" kernel/Kbuild
-  KSU_GIT_TAG=$(curl -sL "https://api.github.com/repos/KernelSU-Next/KernelSU-Next/tags" | grep -o '"name": *"[^"]*"' | head -n 1 | sed 's/"name": "//;s/"//')
-  sed -i "s/KSU_VERSION_TAG_FALLBACK := v0.0.1/KSU_VERSION_TAG_FALLBACK := $KSU_GIT_TAG/g" kernel/Kbuild
+  KSU_GIT_TAG=$(curl -sL "https://api.github.com/repos/KernelSU-Next/KernelSU-Next/tags" | grep -o '"name": *"[^"]*"' | head -n 1 | sed 's/"name": "//;s/"//' || true)
+  if [[ -z "$KSU_GIT_TAG" ]]; then
+    echo ">>> 警告：未能从 GitHub API 获取 KernelSU Next 最新 tag，保留 Kbuild 中的默认值"
+  else
+    sed -i "s/KSU_VERSION_TAG_FALLBACK := v0.0.1/KSU_VERSION_TAG_FALLBACK := $KSU_GIT_TAG/g" kernel/Kbuild
+  fi
   #为KernelSU Next添加WildKSU管理器支持
   cd ../common/drivers/kernelsu
   wget https://github.com/cctv18/oppo_oplus_realme_sm8850/raw/refs/heads/main/other_patch/apk_sign.patch
   patch -p2 -N -F 3 < apk_sign.patch || true
+elif [[ "$KSU_BRANCH" == "f" || "$KSU_BRANCH" == "F" ]]; then
+  echo ">>> 拉取 FinaSU 并设置版本..."
+  # 不依赖上游 kernel/setup.sh 是否存在，直接按其通用布局接入（symlink + Makefile + Kconfig）
+  git clone "https://github.com/$KSU_REPO" ./KernelSU
+  git -C ./KernelSU checkout "$KSU_SRC_BRANCH"
+  if [[ ! -d ./KernelSU/kernel ]]; then
+    echo "错误：FinaSU 源码布局异常，缺少 KernelSU/kernel 目录"
+    exit 1
+  fi
+  ln -sfn "$(realpath --relative-to=./common/drivers ./KernelSU/kernel)" ./common/drivers/kernelsu
+  grep -q 'kernelsu' ./common/drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> ./common/drivers/Makefile
+  grep -q 'drivers/kernelsu/Kconfig' ./common/drivers/Kconfig || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' ./common/drivers/Kconfig
+  verify_ksu_ref ./KernelSU "$KSU_SRC_BRANCH" || exit 1
+  KSU_VERSION=$(expr $(git -C ./KernelSU rev-list --count HEAD) + 40000 2>/dev/null || echo 114514)
+  echo ">>> FinaSU 版本号：$KSU_VERSION"
 elif [[ "$KSU_BRANCH" == "k" || "$KSU_BRANCH" == "K" ]]; then
   echo "正在配置原版 KernelSU (tiann/KernelSU)..."
-  curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/refs/heads/main/kernel/setup.sh" | bash -s main
+  curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/refs/heads/main/kernel/setup.sh" | bash -s "$KSU_SRC_BRANCH"
+  verify_ksu_ref ./KernelSU "$KSU_SRC_BRANCH" || exit 1
   cd ./KernelSU
-  KSU_VERSION=$(expr $(curl -sI "https://api.github.com/repos/tiann/KernelSU/commits?sha=main&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p') "+" 30000)
+  KSU_VERSION=$(expr $(git rev-list --count HEAD) + 30000 2>/dev/null || echo 114514)
   sed -i "s/DKSU_VERSION=16/DKSU_VERSION=${KSU_VERSION}/" kernel/Kbuild
 else
   echo "已选择无内置KernelSU模式，跳过配置..."
@@ -162,7 +252,12 @@ fi
 # ===== 克隆补丁仓库&应用 SUSFS 补丁 =====
 cd "$WORKDIR/kernel_workspace"
 echo ">>> 应用 SUSFS&hook 补丁..."
-if [[ "$APPLY_SUSFS" == [yY] ]]; then
+# FinaSU 自 2026-10 起在 KernelSU 树内原生集成 SUSFS，此时内核侧无需再打补丁
+KSU_NATIVE_SUSFS=0
+if [[ "$KSU_BRANCH" == [fF] && -f ./KernelSU/kernel/extension/susfs.c ]]; then
+  KSU_NATIVE_SUSFS=1
+fi
+if [[ "$APPLY_SUSFS" == [yY] && "$KSU_NATIVE_SUSFS" != "1" ]]; then
   echo ">>> 克隆补丁仓库..."
   git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-android16-6.12
   cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-android16-6.12.patch ./common/
@@ -170,6 +265,8 @@ if [[ "$APPLY_SUSFS" == [yY] ]]; then
   cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
   cd ./common
   patch -p1 -F 3 < 50_add_susfs_in_gki-android16-6.12.patch || true
+elif [[ "$KSU_NATIVE_SUSFS" == "1" ]]; then
+  echo ">>> 检测到 FinaSU 树内原生 SUSFS 集成，跳过内核侧 susfs 补丁..."
 else
   echo ">>> 未开启susfs，跳过susfs补丁配置..."
 fi
@@ -515,6 +612,11 @@ if [[ "$APPLY_REKERNEL" == "y" || "$APPLY_REKERNEL" == "Y" ]]; then
 fi
 if [[ "$APPLY_BBG" == "y" || "$APPLY_BBG" == "Y" ]]; then
   ZIP_NAME="${ZIP_NAME}-bbg"
+fi
+
+# 非默认 KSU 分支时在包名中带上分支标识（斜杠替换为连字符，避免影响路径）
+if [[ -n "$KSU_SRC_BRANCH" && "$KSU_SRC_BRANCH" != "$KSU_DEFAULT_BRANCH" ]]; then
+  ZIP_NAME="${ZIP_NAME}-${KSU_SRC_BRANCH//\//-}"
 fi
 
 ZIP_NAME="${ZIP_NAME}-v$(date +%Y%m%d).zip"
