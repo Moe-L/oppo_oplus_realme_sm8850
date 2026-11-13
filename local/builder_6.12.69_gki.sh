@@ -269,7 +269,14 @@ echo ">>> 应用 SUSFS&hook 补丁..."
 # FinaSU 的 SUSFS 只做驱动侧集成（kernel/extension/susfs.c），内核侧 fs/susfs.c 仍需打补丁
 if [[ "$APPLY_SUSFS" == [yY] ]]; then
   echo ">>> 克隆补丁仓库..."
-  git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-android16-6.12
+  # KSU 源码若已引用 SUSFS v2.4.0 命令（如 BakaSU sync-up），必须用 dev 分支补丁
+  SUSFS_BRANCH="oki-android16-6.12"
+  if grep -Rqs 'CMD_SUSFS_SET_PRIORITY_UID_FILTER' ./KernelSU ./KernelSU-Next 2>/dev/null; then
+    SUSFS_BRANCH="${SUSFS_BRANCH}-dev"
+    echo ">>> 检测到 KSU 源码需要 SUSFS v2.4.0 命令，改用 dev 分支补丁"
+  fi
+  echo ">>> 使用 SUSFS 补丁分支：$SUSFS_BRANCH"
+  git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b "$SUSFS_BRANCH"
   cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-android16-6.12.patch ./common/
   cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
   cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
