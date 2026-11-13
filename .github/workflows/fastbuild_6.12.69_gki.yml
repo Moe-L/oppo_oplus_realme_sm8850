@@ -456,7 +456,16 @@ jobs:
           # 内核侧的 fs/susfs.c 等实现仍需按官方文档打 susfs 补丁，因此这里对所有 KSU 变体一视同仁
           if [[ ${{ github.event.inputs.ksu_type }} != "none" ]]; then
             echo "正在添加susfs补丁..."
-            git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
+            # 不同 KSU 变体依赖的 SUSFS 版本不同：BakaSU sync-up 等分支已引用 v2.4.0 命令
+            # （CMD_SUSFS_SET_PRIORITY_UID_FILTER），用 v2.3.0 补丁会报未声明标识符。
+            # 这里按 KSU 源码实际引用的符号动态切换 susfs4oki 分支（-dev 已包含新命令）。
+            SUSFS_BRANCH="oki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}"
+            if grep -Rqs 'CMD_SUSFS_SET_PRIORITY_UID_FILTER' ./KernelSU ./KernelSU-Next 2>/dev/null; then
+              SUSFS_BRANCH="${SUSFS_BRANCH}-dev"
+              echo "检测到 KSU 源码需要 SUSFS v2.4.0 命令，改用 dev 分支补丁"
+            fi
+            echo "使用 SUSFS 补丁分支：$SUSFS_BRANCH"
+            git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b "$SUSFS_BRANCH"
             cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
             cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
             cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
