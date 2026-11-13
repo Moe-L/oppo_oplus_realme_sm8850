@@ -66,6 +66,9 @@ if [[ -n "$KSU_SRC_BRANCH" && -z "$KSU_REPO" ]]; then
 fi
 KSU_SRC_BRANCH="${KSU_SRC_BRANCH:-$KSU_DEFAULT_BRANCH}"
 
+# 仅 FinaSU 需要把管理器签名作为 make 参数传入，其它变体保持为空
+KSU_MAKE_ARGS=""
+
 # ===== 分支名合法性校验（防注入 / 非法 git ref） =====
 if [[ -n "$KSU_SRC_BRANCH" ]]; then
   if ! [[ "$KSU_SRC_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$ ]]; then
@@ -235,8 +238,19 @@ elif [[ "$KSU_BRANCH" == "f" || "$KSU_BRANCH" == "F" ]]; then
   ln -sfn "$(realpath --relative-to=./common/drivers ./KernelSU/kernel)" ./common/drivers/kernelsu
   grep -q 'kernelsu' ./common/drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> ./common/drivers/Makefile
   grep -q 'drivers/kernelsu/Kconfig' ./common/drivers/Kconfig || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' ./common/drivers/Kconfig
+  # FinaSU 的 Kbuild 用 $(KSU_KERNEL_DIR)=$(srctree)/$(src) 推导 include 路径，内联进 GKI 树时可能落空，
+  # 这里追加构建期解析出的绝对路径，保证 kernel/include/klog.h 与仓库根 uapi/*.h 都能被找到
+  KSU_ABS_DIR="$(cd ./KernelSU && pwd)"
+  printf '\nccflags-y += -I%s -I%s/kernel -I%s/kernel/include\n' "$KSU_ABS_DIR" "$KSU_ABS_DIR" "$KSU_ABS_DIR" >> ./KernelSU/kernel/Kbuild
+  echo ">>> 已为 FinaSU Kbuild 追加 include 路径：$KSU_ABS_DIR"
+  # FinaSU 内核校验管理器 APK 签名，Kbuild 默认值是上游占位值，必须传入 FinaSU 正式管理器的证书信息
+  KSU_EXPECTED_SIZE="0x02cc"
+  KSU_EXPECTED_HASH="2d89b50aaf1db013c2b6738f973f48b62ea21a3a8d7216bfec3521065d448458"
+  KSU_MAKE_ARGS="KSU_EXPECTED_SIZE=$KSU_EXPECTED_SIZE KSU_EXPECTED_HASH=$KSU_EXPECTED_HASH"
+  echo ">>> FinaSU 管理器签名：$KSU_EXPECTED_SIZE / $KSU_EXPECTED_HASH"
   verify_ksu_ref ./KernelSU "$KSU_SRC_BRANCH" || exit 1
-  KSU_VERSION=$(expr $(git -C ./KernelSU rev-list --count HEAD) + 40000 2>/dev/null || echo 114514)
+  # 与 FinaSU Kbuild 自身公式（30000 + 提交数）保持一致
+  KSU_VERSION=$(expr $(git -C ./KernelSU rev-list --count HEAD) + 30000 2>/dev/null || echo 114514)
   echo ">>> FinaSU 版本号：$KSU_VERSION"
 elif [[ "$KSU_BRANCH" == "k" || "$KSU_BRANCH" == "K" ]]; then
   echo "正在配置原版 KernelSU (tiann/KernelSU)..."
@@ -252,21 +266,15 @@ fi
 # ===== 克隆补丁仓库&应用 SUSFS 补丁 =====
 cd "$WORKDIR/kernel_workspace"
 echo ">>> 应用 SUSFS&hook 补丁..."
-# FinaSU 自 2026-10 起在 KernelSU 树内原生集成 SUSFS，此时内核侧无需再打补丁
-KSU_NATIVE_SUSFS=0
-if [[ "$KSU_BRANCH" == [fF] && -f ./KernelSU/kernel/extension/susfs.c ]]; then
-  KSU_NATIVE_SUSFS=1
-fi
-if [[ "$APPLY_SUSFS" == [yY] && "$KSU_NATIVE_SUSFS" != "1" ]]; then
+# FinaSU 的 SUSFS 只做驱动侧集成（kernel/extension/susfs.c），内核侧 fs/susfs.c 仍需打补丁
+if [[ "$APPLY_SUSFS" == [yY] ]]; then
   echo ">>> 克隆补丁仓库..."
   git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-android16-6.12
   cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-android16-6.12.patch ./common/
   cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
   cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
   cd ./common
-  patch -p1 -F 3 < 50_add_susfs_in_gki-android16-6.12.patch || true
-elif [[ "$KSU_NATIVE_SUSFS" == "1" ]]; then
-  echo ">>> 检测到 FinaSU 树内原生 SUSFS 集成，跳过内核侧 susfs 补丁..."
+  patch -p1 -F 3 < 50_add_susfs_in_gki-android16-6.12.patch || echo ">>> 警告：susfs 内核侧补丁有 hunk 未应用（源码可能已包含或已变化）"
 else
   echo ">>> 未开启susfs，跳过susfs补丁配置..."
 fi
@@ -336,8 +344,17 @@ echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$DEFCONFIG_FILE"
 
 # 开启O2编译优化配置
 echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> "$DEFCONFIG_FILE"
-#跳过将uapi标准头安装到 usr/include 目录的不必要操作，节省编译时间
-echo "CONFIG_HEADERS_INSTALL=n" >> "$DEFCONFIG_FILE"
+# 跳过将 uapi 标准头安装到 usr/include 以节省编译时间；
+# 但 FinaSU 的内置编译依赖 usr/include（preinit 与部分 uapi 头），必须保持 =y
+if [[ "$KSU_BRANCH" == [fF] ]]; then
+  echo "CONFIG_HEADERS_INSTALL=y" >> "$DEFCONFIG_FILE"
+  echo "CONFIG_KPROBES=y" >> "$DEFCONFIG_FILE"
+  echo "CONFIG_KALLSYMS_ALL=y" >> "$DEFCONFIG_FILE"
+  echo "CONFIG_EXT4_FS=y" >> "$DEFCONFIG_FILE"
+  echo "CONFIG_THREAD_INFO_IN_TASK=y" >> "$DEFCONFIG_FILE"
+else
+  echo "CONFIG_HEADERS_INSTALL=n" >> "$DEFCONFIG_FILE"
+fi
 
 # 应用 CVE_2026_43499 修复补丁（新版内核源码已应用补丁，无需再应用）
 # cd common
@@ -542,6 +559,7 @@ make -j$(nproc --all) \
     RUSTC="rustc" \
     OBJCOPY="llvm-objcopy" \
     O=out \
+    $KSU_MAKE_ARGS \
     gki_defconfig Image 2>&1 | tee $WORKDIR/build.log
 echo ">>> 内核编译成功！"
 
