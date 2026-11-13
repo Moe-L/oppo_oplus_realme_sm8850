@@ -285,6 +285,20 @@ if [[ "$APPLY_SUSFS" == [yY] ]]; then
 else
   echo ">>> 未开启susfs，跳过susfs补丁配置..."
 fi
+
+# SUSFS v2.4.0 的类型注册接口在 v2.3.0/dev 补丁里没有，部分 KSU 分支会无条件调用导致链接失败，
+# 这里按上游做法把调用编译剔除（sus_path/mount/kstat 等基础功能不受影响）
+if [[ -f ./common/include/linux/susfs.h ]] && ! grep -q 'susfs_add_sus_type' ./common/include/linux/susfs.h; then
+  for d in ./KernelSU ./KernelSU-Next; do
+    [[ -d "$d/kernel" ]] || continue
+    while IFS= read -r f; do
+      sed -i -E 's@^([[:space:]]*)(susfs_add_sus_type\(.*)$@\1/* disabled: kernel SUSFS lacks v2.4.0 registration */ @' "$f"
+      sed -i -E 's@^([[:space:]]*)(susfs_add_sus_avd_allowed_by_type\(.*)$@\1/* disabled: kernel SUSFS lacks v2.4.0 registration */ @' "$f"
+      echo ">>> 已剔除 $f 中的 SUSFS v2.4.0 类型注册调用"
+    done < <(grep -rlE '^[[:space:]]*susfs_add_sus_(type|avd_allowed_by_type)\(' "$d/kernel" 2>/dev/null || true)
+  done
+fi
+
 cd "$WORKDIR/kernel_workspace"
 if [[ "$KSU_BRANCH" == [kK] && "$APPLY_SUSFS" == [yY] ]]; then
   cp ./susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./KernelSU/
