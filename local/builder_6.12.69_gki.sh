@@ -502,6 +502,14 @@ fi
 echo ">>> 禁用 defconfig 检查..."
 sed -i 's/check_defconfig//' ./common/build.config.gki
 
+# Kbuild 用 $(srctree)/$(src) 推导 KSU_KERNEL_DIR，在 O=out + 外置软链的布局下会错一层
+# （表现为 klog.h / uapi 头找不到、preinit/runner/runner.c 找不到），这里用绝对路径覆盖
+if [[ -d ./KernelSU/kernel ]]; then
+  KSU_MAKE_ARGS="KSU_KERNEL_DIR=$(cd ./KernelSU/kernel && pwd) $KSU_MAKE_ARGS"
+elif [[ -d ./KernelSU-Next/kernel ]]; then
+  KSU_MAKE_ARGS="KSU_KERNEL_DIR=$(cd ./KernelSU-Next/kernel && pwd) $KSU_MAKE_ARGS"
+fi
+
 # ===== 编译内核 =====
 echo ">>> 开始编译内核..."
 WORKDIR="$(pwd)"
