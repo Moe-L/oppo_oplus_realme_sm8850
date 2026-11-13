@@ -472,6 +472,25 @@ jobs:
             cd ./common
             patch -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || echo "::warning::susfs 内核侧补丁有 hunk 未应用（源码可能已包含或已变化），请留意后续编译结果"
             cd ..
+
+          # SUSFS v2.4.0 的「类型注册」接口（susfs_add_sus_type / susfs_add_sus_avd_allowed_by_type）
+          # 在 v2.3.0 与当前 dev 补丁里都不存在，而部分 KSU 分支（如 BakaSU sync-up）无条件调用它们，
+          # 会导致 vmlinux 链接失败。补丁不提供接口时按上游既有做法把调用编译剔除，并明确告警。
+          if [ -f ./common/include/linux/susfs.h ] && ! grep -q 'susfs_add_sus_type' ./common/include/linux/susfs.h; then
+            echo "::warning::当前 SUSFS 内核补丁不含 v2.4.0 类型注册接口，已剔除 KSU 侧调用（sus_path/mount/kstat 等基础功能不受影响）"
+            for d in ./KernelSU ./KernelSU-Next; do
+              [ -d "$d/kernel" ] || continue
+              while IFS= read -r f; do
+                sed -i -E 's@^([[:space:]]*)(susfs_add_sus_type\(.*)$@\1/* disabled: kernel SUSFS lacks v2.4.0 registration */ @' "$f"
+                sed -i -E 's@^([[:space:]]*)(susfs_add_sus_avd_allowed_by_type\(.*)$@\1/* disabled: kernel SUSFS lacks v2.4.0 registration */ @' "$f"
+                echo "已剔除 $f 中的 SUSFS v2.4.0 类型注册调用"
+              done < <(grep -rlE '^[[:space:]]*susfs_add_sus_(type|avd_allowed_by_type)\(' "$d/kernel" 2>/dev/null || true)
+              if grep -rnE '^[[:space:]]*susfs_add_sus_(type|avd_allowed_by_type)\(' "$d/kernel" 2>/dev/null; then
+                echo "::error::$d 仍有未处理的 SUSFS 类型注册调用"
+                exit 1
+              fi
+            done
+          fi
           else
             echo "已选择无内置KernelSU模式，跳过susfs配置..."
           fi
