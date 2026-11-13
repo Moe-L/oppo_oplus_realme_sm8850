@@ -443,6 +443,9 @@ jobs:
             ABS_DIR="$(cd "$d" && pwd)"
             printf '\n# ksu-include-hardening (added by cctv18 builder)\nccflags-y += -I%s -I%s/kernel -I%s/kernel/include\n' "$ABS_DIR" "$ABS_DIR" "$ABS_DIR" >> "$d/kernel/Kbuild"
             echo "已为 $d 追加 include 兜底：$ABS_DIR"
+            # Kbuild 里 $(srctree)/$(src) 推导出的 KSU_KERNEL_DIR 在本构建方式下会错一层，
+            # 用绝对路径覆盖（Kbuild 用 ifndef 保护，命令行赋值优先）
+            echo "KSU_KERNEL_DIR_ABS=$ABS_DIR/kernel" >> $GITHUB_ENV
           done
 
       - name: 应用 KernelSU & SUSFS 补丁
@@ -834,11 +837,18 @@ jobs:
           sudo rm -rf /usr/local/lib/android &
           sudo rm -rf /opt/ghc &
           sudo rm -rf /opt/hostedtoolcache/CodeQL &
-          # FinaSU 需要把管理器签名作为 make 参数传入；其它管理器没有这两个变量，留空即可
+          # KSU 侧 make 参数：
+          #   1) KSU_KERNEL_DIR：Kbuild 默认用 $(srctree)/$(src) 推导，在 O=out + 外置软链时会拼错一层
+          #      （表现为 klog.h/uapi 找不到、preinit/runner/runner.c 找不到），这里用绝对路径覆盖。
+          #   2) KSU_EXPECTED_SIZE/HASH：FinaSU 校验管理器签名所需。
           KSU_MAKE_ARGS=""
+          if [ -n "${KSU_KERNEL_DIR_ABS:-}" ]; then
+            KSU_MAKE_ARGS="KSU_KERNEL_DIR=$KSU_KERNEL_DIR_ABS"
+            echo "KSU_KERNEL_DIR 覆盖为：$KSU_KERNEL_DIR_ABS"
+          fi
           if [ -n "${KSU_EXPECTED_SIZE:-}" ] && [ -n "${KSU_EXPECTED_HASH:-}" ]; then
-            KSU_MAKE_ARGS="KSU_EXPECTED_SIZE=$KSU_EXPECTED_SIZE KSU_EXPECTED_HASH=$KSU_EXPECTED_HASH"
-            echo "管理器签名参数：$KSU_MAKE_ARGS"
+            KSU_MAKE_ARGS="$KSU_MAKE_ARGS KSU_EXPECTED_SIZE=$KSU_EXPECTED_SIZE KSU_EXPECTED_HASH=$KSU_EXPECTED_HASH"
+            echo "管理器签名参数：KSU_EXPECTED_SIZE=$KSU_EXPECTED_SIZE KSU_EXPECTED_HASH=$KSU_EXPECTED_HASH"
           fi
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out gki_defconfig &&
           export CC="$(pwd)/cc-wrapper" && export LD="$(pwd)/ld-wrapper" &&
