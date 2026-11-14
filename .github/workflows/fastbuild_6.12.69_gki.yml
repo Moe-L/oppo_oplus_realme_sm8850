@@ -489,8 +489,9 @@ jobs:
               fi
             fi
             cd ..
-            # v2.4.0 契约下必须确认补丁真的提供了类型注册接口，否则 sync-up 的反检测修复等于没编进去
-            if [ "$SUSFS_NEEDS_V240" = "1" ] && ! grep -q 'susfs_add_sus_type' ./common/include/linux/susfs.h; then
+            # v2.4.0 契约下必须确认补丁真的提供了类型注册接口（实现体在 fs/susfs.c，头文件里没有声明），
+            # 否则 sync-up 的反检测修复等于没编进去
+            if [ "$SUSFS_NEEDS_V240" = "1" ] && ! grep -qs 'susfs_add_sus_type' ./common/fs/susfs.c ./common/include/linux/susfs.h; then
               echo "::error::KSU 需要 SUSFS v2.4.0 类型注册接口，但补丁未提供，继续编译必然链接失败"
               exit 1
             fi
