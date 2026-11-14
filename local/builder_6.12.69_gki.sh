@@ -269,34 +269,45 @@ echo ">>> 应用 SUSFS&hook 补丁..."
 # FinaSU 的 SUSFS 只做驱动侧集成（kernel/extension/susfs.c），内核侧 fs/susfs.c 仍需打补丁
 if [[ "$APPLY_SUSFS" == [yY] ]]; then
   echo ">>> 克隆补丁仓库..."
-  # KSU 源码若已引用 SUSFS v2.4.0 命令（如 BakaSU sync-up），必须用 dev 分支补丁
-  SUSFS_BRANCH="oki-android16-6.12"
-  if grep -Rqs 'CMD_SUSFS_SET_PRIORITY_UID_FILTER' ./KernelSU ./KernelSU-Next 2>/dev/null; then
-    SUSFS_BRANCH="${SUSFS_BRANCH}-dev"
-    echo ">>> 检测到 KSU 源码需要 SUSFS v2.4.0 命令，改用 dev 分支补丁"
+  # 按 KSU 源码需要的 SUSFS 契约选择补丁来源：
+  #   1) 引用 susfs_add_sus_type（v2.4.0 类型注册，如 BakaSU sync-up / FinaSU）→ 必须用上游 v2.4.0 补丁，
+  #      否则内核侧的反检测修复会被编译剔除，检测照样命中；
+  #   2) 仅引用 CMD_SUSFS_SET_PRIORITY_UID_FILTER → cctv18 fork 的 -dev 分支；
+  #   3) 其余 → cctv18 fork 稳定分支。
+  SUSFS_NEEDS_V240=0
+  if grep -Rqs 'susfs_add_sus_type' ./KernelSU ./KernelSU-Next 2>/dev/null; then
+    SUSFS_NEEDS_V240=1
+    SUSFS_REPO="https://gitlab.com/simonpunk/susfs4ksu.git"
+    SUSFS_BRANCH="gki-android16-6.12"
+    echo ">>> 检测到 KSU 需要 SUSFS v2.4.0 类型注册接口，使用上游 v2.4.0 补丁"
+  else
+    SUSFS_REPO="https://github.com/cctv18/susfs4oki.git"
+    SUSFS_BRANCH="oki-android16-6.12"
+    if grep -Rqs 'CMD_SUSFS_SET_PRIORITY_UID_FILTER' ./KernelSU ./KernelSU-Next 2>/dev/null; then
+      SUSFS_BRANCH="${SUSFS_BRANCH}-dev"
+      echo ">>> 检测到 KSU 需要 priority-uid 命令，使用 dev 分支补丁"
+    fi
   fi
-  echo ">>> 使用 SUSFS 补丁分支：$SUSFS_BRANCH"
-  git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b "$SUSFS_BRANCH"
+  echo ">>> 使用 SUSFS 补丁：$SUSFS_REPO @ $SUSFS_BRANCH"
+  git clone --depth=1 "$SUSFS_REPO" susfs4ksu -b "$SUSFS_BRANCH"
   cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-android16-6.12.patch ./common/
   cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
   cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
   cd ./common
-  patch -p1 -F 3 < 50_add_susfs_in_gki-android16-6.12.patch || echo ">>> 警告：susfs 内核侧补丁有 hunk 未应用（源码可能已包含或已变化）"
+  if ! patch -p1 -F 3 < 50_add_susfs_in_gki-android16-6.12.patch; then
+    echo ">>> 警告：susfs 内核侧补丁有 hunk 未应用（源码可能已包含或已变化）"
+    if [[ "$SUSFS_NEEDS_V240" == "1" ]]; then
+      echo "错误：v2.4.0 补丁未完整应用，SUSFS 类型注册会缺失，中止"
+      exit 1
+    fi
+  fi
+  cd ..
+  if [[ "$SUSFS_NEEDS_V240" == "1" ]] && ! grep -q 'susfs_add_sus_type' ./common/include/linux/susfs.h; then
+    echo "错误：KSU 需要 SUSFS v2.4.0 类型注册接口，但补丁未提供"
+    exit 1
+  fi
 else
   echo ">>> 未开启susfs，跳过susfs补丁配置..."
-fi
-
-# SUSFS v2.4.0 的类型注册接口在 v2.3.0/dev 补丁里没有，部分 KSU 分支会无条件调用导致链接失败，
-# 这里按上游做法把调用编译剔除（sus_path/mount/kstat 等基础功能不受影响）
-if [[ -f ./common/include/linux/susfs.h ]] && ! grep -q 'susfs_add_sus_type' ./common/include/linux/susfs.h; then
-  for d in ./KernelSU ./KernelSU-Next; do
-    [[ -d "$d/kernel" ]] || continue
-    while IFS= read -r f; do
-      sed -i -E 's@^([[:space:]]*)(susfs_add_sus_type\(.*)$@\1/* disabled: kernel SUSFS lacks v2.4.0 registration */ @' "$f"
-      sed -i -E 's@^([[:space:]]*)(susfs_add_sus_avd_allowed_by_type\(.*)$@\1/* disabled: kernel SUSFS lacks v2.4.0 registration */ @' "$f"
-      echo ">>> 已剔除 $f 中的 SUSFS v2.4.0 类型注册调用"
-    done < <(grep -rlE '^[[:space:]]*susfs_add_sus_(type|avd_allowed_by_type)\(' "$d/kernel" 2>/dev/null || true)
-  done
 fi
 
 cd "$WORKDIR/kernel_workspace"
