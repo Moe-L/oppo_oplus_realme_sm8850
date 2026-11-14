@@ -302,7 +302,8 @@ if [[ "$APPLY_SUSFS" == [yY] ]]; then
     fi
   fi
   cd ..
-  if [[ "$SUSFS_NEEDS_V240" == "1" ]] && ! grep -q 'susfs_add_sus_type' ./common/include/linux/susfs.h; then
+  # 实现体在 fs/susfs.c（头文件里没有声明）
+  if [[ "$SUSFS_NEEDS_V240" == "1" ]] && ! grep -qs 'susfs_add_sus_type' ./common/fs/susfs.c ./common/include/linux/susfs.h; then
     echo "错误：KSU 需要 SUSFS v2.4.0 类型注册接口，但补丁未提供"
     exit 1
   fi
